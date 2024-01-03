@@ -1,0 +1,89 @@
+// one job per arch (for now) that copies built images to the arch-specific namespaces
+properties([
+	disableConcurrentBuilds(),
+	disableResume(),
+	durabilityHint('PERFORMANCE_OPTIMIZED'),
+	pipelineTriggers([
+		upstream(threshold: 'UNSTABLE', upstreamProjects: 'meta'),
+	]),
+])
+
+env.BASHBREW_ARCH = env.JOB_NAME.split('/')[-1].minus('deploy-') // "windows-amd64", "arm64v8", etc
+
+node('multiarch-' + env.BASHBREW_ARCH) { ansiColor('xterm') {
+	stage('Checkout') {
+		checkout(scmGit(
+			userRemoteConfigs: [[
+				url: 'https://github.com/docker-library/meta.git',
+				name: 'origin',
+			]],
+			branches: [[name: '*/subset']], // TODO back to main
+			extensions: [
+				submodule(
+					parentCredentials: true,
+					recursiveSubmodules: true,
+					trackingSubmodules: true,
+				),
+				cleanBeforeCheckout(),
+				cleanAfterCheckout(),
+				[$class: 'RelativeTargetDirectory', relativeTargetDir: 'meta'],
+			],
+		))
+	}
+
+	dir('.bin') {
+		deleteDir()
+
+		stage('Crane') {
+			sh '''#!/usr/bin/env bash
+				set -Eeuo pipefail -x
+
+				ext=''
+				if [ "$BASHBREW_ARCH" = 'windows-amd64' ]; then
+					ext='.exe'
+				fi
+
+				# https://doi-janky.infosiftr.net/job/wip/job/crane
+				wget -O "crane$ext" "https://doi-janky.infosiftr.net/job/wip/job/crane/lastSuccessfulBuild/artifact/crane-$BASHBREW_ARCH$ext" --progress=dot:giga
+				# TODO checksum verification ("checksums.txt")
+				chmod +x "crane$ext"
+				"./crane$ext" version
+			'''
+			if (env.BASHBREW_ARCH == 'windows-amd64') {
+				env.PATH = "${workspace}/.bin;${env.PATH}"
+			} else {
+				env.PATH = "${workspace}/.bin:${env.PATH}"
+			}
+		}
+	}
+
+	dir('meta') {
+		def shell = ''
+		stage('Generate') {
+			shell = sh(returnStdout: true, script: '''#!/usr/bin/env bash
+				set -Eeuo pipefail -x
+
+				jq -L.scripts -r '
+					include "jenkins";
+					crane_deploy_commands
+					| sub("^crane "; "crane --mirror \\"$DOCKERHUB_PUBLIC_PROXY_HOST\\" ")
+				' builds.json
+			''').trim()
+
+			shell = shell.replaceAll("\r", '') // deal with Windows...
+		}
+
+		withCredentials([
+			string(credentialsId: 'dockerhub-public-proxy', variable: 'DOCKERHUB_PUBLIC_PROXY'),
+			string(credentialsId: 'dockerhub-public-proxy-host', variable: 'DOCKERHUB_PUBLIC_PROXY_HOST'),
+		]) {
+			stage('Deploy') {
+				sh """#!/usr/bin/env bash
+					set -Eeuo pipefail -x
+
+					${ shell }
+				"""
+			}
+		}
+	}
+} }
